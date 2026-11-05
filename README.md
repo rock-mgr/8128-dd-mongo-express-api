@@ -52,3 +52,6 @@ curl -i http://localhost:3000/protected-route
 ## JWT PROFILE
 curl -s -i http://localhost:3000/profile \
   -H "Authorization: Bearer $TOKEN"
+
+## INSTALL GEMINI
+npm install @google/genai dotenv

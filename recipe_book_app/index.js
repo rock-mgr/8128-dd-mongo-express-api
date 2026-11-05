@@ -2,10 +2,12 @@ const bcrypt = require('bcrypt');
 const { ObjectId } = require('mongodb');
 const { connect } = require('./db');
 const jwt = require('jsonwebtoken');
+const { GoogleGenAI } = require('@google/genai');
 
 const express = require("express");
 const cors = require("cors");
 require("dotenv").config();
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 const mongoUri = process.env.MONGO_URI;
 const dbname = "recipe_book";
@@ -51,6 +53,187 @@ async function main() {
             });
         });
 
+        app.get('/ai/test', async (req, res) => {
+            try {
+                const response = await ai.models.generateContent({
+                    model: 'gemini-3.1-flash-lite',
+                    contents: 'Reply with exactly: Gemini connection successful'
+                });
+
+                res.json({
+                    message: response.text
+                });
+            } catch (error) {
+                console.error('Gemini error:', error);
+                res.status(500).json({
+                    error: 'Gemini request failed'
+                });
+            }
+        });
+
+
+        app.get('/ai/recipes', verifyToken, async (req, res) => {
+            try {
+                const search = req.query.search;
+
+                if (!search) {
+                    return res.status(400).json({
+                        error: 'Search query is required'
+                    });
+                }
+
+                // Ask Gemini to interpret the natural-language search
+                const response = await ai.models.generateContent({
+                    model: 'gemini-3.1-flash-lite',
+                    contents: `
+                Convert this recipe search into JSON filters.
+
+                Search: ${JSON.stringify(search)}
+
+                Return only a JSON object with these optional fields:
+                name, cuisine, ingredients, tags.
+
+                Each field must be a string.
+                Example:
+                {"cuisine":"Italian","ingredients":"tomato"}
+
+                Do not include Markdown or explanations.
+            `,
+                    config: {
+                        responseMimeType: 'application/json'
+                    }
+                });
+
+                const filters = JSON.parse(response.text);
+
+                // Only accept supported filter fields
+                const query = {};
+
+                if (typeof filters.name === 'string') {
+                    query.name = { $regex: filters.name, $options: 'i' };
+                }
+
+                if (typeof filters.cuisine === 'string') {
+                    query['cuisine.name'] = {
+                        $regex: filters.cuisine,
+                        $options: 'i'
+                    };
+                }
+
+                if (typeof filters.ingredients === 'string') {
+                    query['ingredients.name'] = {
+                        $regex: filters.ingredients,
+                        $options: 'i'
+                    };
+                }
+
+                if (typeof filters.tags === 'string') {
+                    query['tags.name'] = {
+                        $regex: filters.tags,
+                        $options: 'i'
+                    };
+                }
+
+                const recipes = await db.collection('recipes')
+                    .find(query)
+                    .limit(20)
+                    .toArray();
+
+                res.json({ filters, recipes });
+
+            } catch (error) {
+                console.error('AI recipe search error:', error);
+
+                res.status(500).json({
+                    error: 'AI recipe search failed'
+                });
+            }
+        });
+
+
+        app.post('/ai/recipes', verifyToken, async (req, res) => {
+            try {
+                const description = req.body.description;
+
+                if (typeof description !== 'string' || !description.trim()) {
+                    return res.status(400).json({
+                        error: 'Recipe description is required'
+                    });
+                }
+
+                const response = await ai.models.generateContent({
+                    model: 'gemini-3.1-flash-lite',
+                    contents: `
+                Convert the following recipe description into JSON.
+
+                Description: ${JSON.stringify(description)}
+
+                Return a JSON object with:
+                - name: string
+                - cuisine: object with a name field
+                - ingredients: array of objects with name fields
+                - tags: array of objects with name fields
+                - instructions: array of strings
+
+                Return only JSON, without Markdown.
+            `,
+                    config: {
+                        responseMimeType: 'application/json'
+                    }
+                });
+
+                const recipe = JSON.parse(response.text);
+
+                // Check Gemini's output before saving
+                if (
+                    !recipe ||
+                    typeof recipe.name !== 'string' ||
+                    !recipe.name.trim() ||
+                    !recipe.cuisine ||
+                    typeof recipe.cuisine.name !== 'string' ||
+                    !Array.isArray(recipe.ingredients) ||
+                    !recipe.ingredients.every(
+                        item => item && typeof item.name === 'string'
+                    ) ||
+                    !Array.isArray(recipe.tags) ||
+                    !recipe.tags.every(
+                        item => item && typeof item.name === 'string'
+                    ) ||
+                    !Array.isArray(recipe.instructions) ||
+                    !recipe.instructions.every(
+                        item => typeof item === 'string'
+                    )
+                ) {
+                    return res.status(502).json({
+                        error: 'Gemini returned an invalid recipe structure'
+                    });
+                }
+
+                const result = await db.collection('recipes').insertOne({
+                    name: recipe.name,
+                    cuisine: { name: recipe.cuisine.name },
+                    ingredients: recipe.ingredients.map(item => ({
+                        name: item.name
+                    })),
+                    tags: recipe.tags.map(item => ({
+                        name: item.name
+                    })),
+                    instructions: recipe.instructions
+                });
+
+                res.status(201).json({
+                    message: 'AI recipe created successfully',
+                    insertedId: result.insertedId
+                });
+
+            } catch (error) {
+                console.error('AI recipe creation error:', error);
+
+                res.status(500).json({
+                    error: 'AI recipe creation failed'
+                });
+            }
+        });
 
 
         app.get('/recipes', async (req, res) => {
